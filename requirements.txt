@@ -1,0 +1,14 @@
+selenium
+webdriver-manager
+pandas
+openpyxl
+python-dotenv
+beautifulsoup4
+lxml
+google-genai
+playwright
+playwright-stealth
+camoufox[geoip]
+fastapi
+uvicorn[standard]
+python-multipart
