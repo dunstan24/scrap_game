@@ -54,13 +54,17 @@ class PCGamingWikiScraper:
             except:
                 pass
 
-    async def scrape(self, start_url: str = START_URL, max_pages: int = 1, max_games_per_page: int = 0, should_cancel=None, target_alphabet: str = None, existing_urls: set = None) -> List[Dict[str, Any]]:
+    async def scrape(self, start_url: str = START_URL, max_pages: int = 1, max_games_per_page: int = 0,
+                     should_cancel=None, target_alphabet: str = None, existing_urls: set = None,
+                     checkpoint_callback=None, checkpoint_every: int = 500) -> List[Dict[str, Any]]:
         """
         Main scraping loop:
         1. Navigate to List Page
         2. Extract game links
         3. Visit each game link and extract system requirements
         4. Go to Next Page
+
+        checkpoint_callback: called every `checkpoint_every` games with (list_of_new_games, total_so_far)
         """
         if existing_urls is None:
             existing_urls = set()
@@ -72,6 +76,7 @@ class PCGamingWikiScraper:
         all_scraped_games = []
         current_url = start_url
         current_page_num = 1
+        games_since_last_checkpoint = 0
 
         try:
             if not self.page:
@@ -144,12 +149,22 @@ class PCGamingWikiScraper:
                 for idx, game_info in enumerate(game_links):
                     if should_cancel and should_cancel():
                         logger.info("Cancellation detected! Stopping game extraction.")
+                        # Trigger final checkpoint before stopping
+                        if checkpoint_callback and games_since_last_checkpoint > 0:
+                            checkpoint_callback(all_scraped_games, len(all_scraped_games))
                         return all_scraped_games
 
                     logger.info(f"  [{idx+1}/{len(game_links)}] Scraping: {game_info['title']}")
                     game_data = await self._extract_game_details(game_info['url'], game_info['title'])
                     if game_data:
                         all_scraped_games.append(game_data)
+                        games_since_last_checkpoint += 1
+
+                        # --- Checkpoint save every N games ---
+                        if checkpoint_callback and games_since_last_checkpoint >= checkpoint_every:
+                            logger.info(f"  [CHECKPOINT] {len(all_scraped_games)} games scraped. Saving checkpoint...")
+                            checkpoint_callback(all_scraped_games, len(all_scraped_games))
+                            games_since_last_checkpoint = 0
                     
                     # Be polite to the wiki
                     adaptive_delay(1, DELAY_BETWEEN_REQUESTS)
@@ -175,6 +190,7 @@ class PCGamingWikiScraper:
         finally:
             await self.close()
 
+
     async def _extract_game_details(self, url: str, title: str) -> Optional[Dict[str, Any]]:
         """Extract System Requirements and other details from a single game page"""
         try:
@@ -190,6 +206,8 @@ class PCGamingWikiScraper:
                 "Title": title,
                 "URL": url,
                 "Scraped_At": datetime.now().isoformat(),
+                "Description": "N/A",
+                "Cover_Image_URL": "N/A",
                 "OS_Minimum": "N/A",
                 "CPU_Minimum": "N/A",
                 "RAM_Minimum": "N/A",
@@ -201,6 +219,43 @@ class PCGamingWikiScraper:
                 "GPU_Recommended": "N/A",
                 "Storage_Recommended": "N/A"
             }
+
+            # --- Extract Cover Image URL ---
+            # Image is inside: td.template-infobox-cover > a > img
+            cover_img = soup.select_one('td.template-infobox-cover img')
+            if cover_img:
+                # Try to get the full-size image from srcset (format: "url 1.5x, url_full 2x")
+                srcset = cover_img.get('srcset', '')
+                if srcset:
+                    # The last entry in srcset is the highest resolution (2x = full size)
+                    last_entry = srcset.strip().split(',')[-1].strip()
+                    full_url = last_entry.split(' ')[0].strip()
+                    if full_url.startswith('http'):
+                        data["Cover_Image_URL"] = full_url
+                    else:
+                        data["Cover_Image_URL"] = cover_img.get('src', 'N/A')
+                else:
+                    data["Cover_Image_URL"] = cover_img.get('src', 'N/A')
+
+            # --- Extract Game Description ---
+            # Description is inside: div.introduction (class, not id!)
+            intro_div = soup.find('div', class_='introduction')
+            if intro_div:
+                # Get all paragraph text, skipping empty paragraphs (class="mw-empty-elt")
+                paragraphs = intro_div.find_all('p')
+                description_parts = []
+                for p in paragraphs:
+                    # Skip empty paragraphs
+                    if 'mw-empty-elt' in p.get('class', []):
+                        continue
+                    text = clean_text(p.get_text())
+                    # Remove citation markers like [Note 1], [2], [3]
+                    import re
+                    text = re.sub(r'\[.*?\]', '', text).strip()
+                    if text:
+                        description_parts.append(text)
+                if description_parts:
+                    data["Description"] = ' '.join(description_parts)
 
             # Based on user's HTML: <table class="pcgwikitable template-infotable" id="table-sysreqs-windows">
             sysreq_table = soup.find('table', id='table-sysreqs-windows')
